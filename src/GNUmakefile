@@ -15,6 +15,21 @@ READELF  ?= $(CROSS_COMPILE)readelf
 OBJCOPY  ?= $(CROSS_COMPILE)objcopy
 OBJDUMP  ?= $(CROSS_COMPILE)objdump
 
+# NDK cross-compilation support: set CC_TARGET and CC_SYSROOT to inject
+# --target= and --sysroot= flags into every CC/LD invocation.
+# This eliminates the need for external cc-wrapper.sh scripts.
+# Example: make CC=clang CC_TARGET=aarch64-linux-android28 CC_SYSROOT=/path/to/sysroot
+ifdef CC_TARGET
+  CC_TARGET_FLAGS := --target=$(CC_TARGET) --sysroot=$(CC_SYSROOT)
+else
+  CC_TARGET_FLAGS :=
+endif
+ifdef CC32_TARGET
+  CC32_TARGET_FLAGS := --target=$(CC32_TARGET) --sysroot=$(CC_SYSROOT)
+else
+  CC32_TARGET_FLAGS :=
+endif
+
 CPPFLAGS += -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$(VPATH)
 CFLAGS   += -Wall -Wextra -O2
 LDFLAGS  += -ltalloc -Wl,-z,noexecstack
@@ -142,16 +157,28 @@ endif
 ######################################################################
 # Auto-configuration
 
-CHECK_VERSION = VERSION=$$($(GIT) describe --tags --dirty --abbrev=8 --always 2>/dev/null); \
+# For cross-compilation, set VERSION, HAVE_PROCESS_VM, and/or
+# HAVE_SECCOMP_FILTER on the command line to skip auto-detection
+# (the .check_* test programs cannot run on the build host).
+# Example: make VERSION=5.1.107 HAVE_PROCESS_VM=1 HAVE_SECCOMP_FILTER=1
+
+ifdef VERSION
+  CHECK_VERSION = printf "\#undef VERSION\n\#define VERSION \"$(VERSION)\"\n";
+else
+  CHECK_VERSION = VERSION=$$($(GIT) describe --tags --dirty --abbrev=8 --always 2>/dev/null); \
 		if [ ! -z "$${VERSION}" ]; \
 		then printf "\#undef VERSION\n\#define VERSION \"$${VERSION}\"\n"; \
 		fi;
+endif
 
 CHECK_FEATURES = process_vm seccomp_filter
 CHECK_PROGRAMS = $(foreach feature,$(CHECK_FEATURES),.check_$(feature))
 CHECK_OBJECTS  = $(foreach feature,$(CHECK_FEATURES),.check_$(feature).o)
 CHECK_RESULTS  = $(foreach feature,$(CHECK_FEATURES),.check_$(feature).res)
 
+# When HAVE_<FEATURE> is pre-set, write the #define directly without
+# compiling and running the test program.  The .check_%.res rule is
+# still the single entry point so the build.h rule stays unchanged.
 .SILENT .IGNORE .INTERMEDIATE: $(CHECK_OBJECTS) $(CHECK_PROGRAMS)
 
 .check_%.o: .check_%.c
@@ -160,8 +187,21 @@ CHECK_RESULTS  = $(foreach feature,$(CHECK_FEATURES),.check_$(feature).res)
 .check_%: .check_%.o
 	-$(LINK:echo=false) $(silently)
 
-.check_%.res: .check_%
-	$(Q)if [ -e $< ]; then echo "#define HAVE_$(shell echo $* | tr a-z A-Z)" > $@; else echo "" > $@; fi
+ifdef HAVE_PROCESS_VM
+.check_process_vm.res:
+	$(Q)echo "#define HAVE_PROCESS_VM" > $@
+else
+.check_process_vm.res: .check_process_vm
+	$(Q)if [ -e $< ]; then echo "#define HAVE_PROCESS_VM" > $@; else echo "" > $@; fi
+endif
+
+ifdef HAVE_SECCOMP_FILTER
+.check_seccomp_filter.res:
+	$(Q)echo "#define HAVE_SECCOMP_FILTER" > $@
+else
+.check_seccomp_filter.res: .check_seccomp_filter
+	$(Q)if [ -e $< ]; then echo "#define HAVE_SECCOMP_FILTER" > $@; else echo "" > $@; fi
+endif
 
 build.h: $(CHECK_RESULTS)
 	$($(quiet)GEN)
@@ -183,8 +223,8 @@ endif
 
 # Use $< instead of $(SRC)$< because VPATH already resolves source paths.
 # $(SRC)$< duplicates the prefix in out-of-tree builds.
-COMPILE = $($(quiet)CC) $(CPPFLAGS) $(CFLAGS) -MD -c $< -o $@
-LINK    = $($(quiet)LD) -o $@ $^ $(LDFLAGS)
+COMPILE = $($(quiet)CC) $(CC_TARGET_FLAGS) $(CPPFLAGS) $(CFLAGS) -MD -c $< -o $@
+LINK    = $($(quiet)LD) $(CC_TARGET_FLAGS) -o $@ $^ $(LDFLAGS)
 
 OBJIFY = $($(quiet)GEN)									\
 	$(OBJCOPY)									\
@@ -244,14 +284,14 @@ LOADER_LDFLAGS$1 += -static -nostdlib -Wl$(BUILD_ID_NONE),-Ttext=$(LOADER_ADDRES
 
 loader/loader$1.o: loader/loader.c
 	@mkdir -p $$(dir $$@)
-	$$(COMPILE) $1 $$(LOADER_CFLAGS$1)
+	$$(COMPILE) $$(LOADER_CFLAGS$1)
 
 loader/assembly$1.o: loader/assembly.S
 	@mkdir -p $$(dir $$@)
-	$$(COMPILE) $1 $$(LOADER_CFLAGS$1)
+	$$(COMPILE) $$(LOADER_CFLAGS$1)
 
 loader/loader$1: $$(LOADER$1_OBJECTS)
-	$$($$(quiet)LD) $1 -o $$@ $$^ $$(LOADER_LDFLAGS$1)
+	$$($$(quiet)LD) $$(CC_TARGET_FLAGS) -o $$@ $$^ $$(LOADER_LDFLAGS$1)
 
 .INTERMEDIATE: loader$1.exe
 loader$1.exe: loader/loader$1
@@ -275,23 +315,26 @@ LOADER_32_OBJECTS = loader/loader-m32.o loader/assembly-m32.o
 
 # Use CC32+CC32_FLAG (not CC -m32) for arch detection so NDK clang works.
 # Allow command-line override for cross-compilation environments.
+ifndef LOADER_ARCH_CFLAGS-m32
+LOADER_ARCH_CFLAGS-m32 := $(shell $(CC32) $(CC32_FLAG) -E -dM -DNO_LIBC_HEADER $(VPATH)/arch.h | grep -w LOADER_ARCH_CFLAGS | cut -f 3 -d ' ')
+endif
 ifndef LOADER_ADDRESS-m32
 LOADER_ADDRESS-m32 := $(shell $(CC32) $(CC32_FLAG) -E -dM -DNO_LIBC_HEADER $(VPATH)/arch.h | grep -w LOADER_ADDRESS | cut -f 3 -d ' ')
 endif
 
-LOADER_CFLAGS-m32  += -fPIC -ffreestanding
+LOADER_CFLAGS-m32  += -fPIC -ffreestanding $(LOADER_ARCH_CFLAGS-m32)
 LOADER_LDFLAGS-m32 += -static -nostdlib -Wl$(BUILD_ID_NONE),-Ttext=$(LOADER_ADDRESS-m32),--rosegment,-z,noexecstack
 
 loader/loader-m32.o: loader/loader.c
 	@mkdir -p $(dir $@)
-	$(CC32) $(CPPFLAGS) $(CFLAGS) $(CC32_FLAG) -MD -c $< -o $@ $(LOADER_CFLAGS-m32)
+	$(CC32) $(CC32_TARGET_FLAGS) $(CPPFLAGS) $(CFLAGS) $(CC32_FLAG) -MD -c $< -o $@ $(LOADER_CFLAGS-m32)
 
 loader/assembly-m32.o: loader/assembly.S
 	@mkdir -p $(dir $@)
-	$(CC32) $(CPPFLAGS) $(CFLAGS) $(CC32_FLAG) -MD -c $< -o $@ $(LOADER_CFLAGS-m32)
+	$(CC32) $(CC32_TARGET_FLAGS) $(CPPFLAGS) $(CFLAGS) $(CC32_FLAG) -MD -c $< -o $@ $(LOADER_CFLAGS-m32)
 
 loader/loader-m32: $(LOADER_32_OBJECTS)
-	$(LD32) $(CC32_FLAG) -o $@ $^ $(LOADER_LDFLAGS-m32)
+	$(LD32) $(CC32_TARGET_FLAGS) $(CC32_FLAG) -o $@ $^ $(LOADER_LDFLAGS-m32)
 
 .INTERMEDIATE: loader-m32.exe
 loader-m32.exe: loader/loader-m32
