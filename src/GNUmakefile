@@ -11,6 +11,7 @@ INSTALL  = install
 CC       ?= $(CROSS_COMPILE)gcc
 LD       = $(CC)
 STRIP    ?= $(CROSS_COMPILE)strip
+READELF  ?= $(CROSS_COMPILE)readelf
 OBJCOPY  ?= $(CROSS_COMPILE)objcopy
 OBJDUMP  ?= $(CROSS_COMPILE)objdump
 
@@ -86,11 +87,18 @@ OBJECTS += \
 	extension/fix_symlink_size/fix_symlink_size.o
 
 define define_from_arch.h
-$2$1 := $(shell $(CC) $1 -E -dM -DNO_LIBC_HEADER $(SRC)/arch.h | grep -w $2 | cut -f 3 -d ' ')
+$2$1 := $(shell $(CC) $1 -E -dM -DNO_LIBC_HEADER $(VPATH)/arch.h | grep -w $2 | cut -f 3 -d ' ')
 endef
 
+# Allow overriding HAS_LOADER_32BIT and HAS_POKEDATA_WORKAROUND from the
+# command line (e.g. for cross-compilation where $(shell $(CC) -E ...) may
+# not work with the host make's shell).  Only auto-detect when not set.
+ifndef HAS_LOADER_32BIT
 $(eval $(call define_from_arch.h,,HAS_LOADER_32BIT))
+endif
+ifndef HAS_POKEDATA_WORKAROUND
 $(eval $(call define_from_arch.h,,HAS_POKEDATA_WORKAROUND))
+endif
 
 ifdef PROOT_UNBUNDLE_LOADER
   CFLAGS += "-DPROOT_UNBUNDLE_LOADER=\"$(PROOT_UNBUNDLE_LOADER)\""
@@ -164,12 +172,18 @@ build.h: $(CHECK_RESULTS)
 	$(Q)cat $^                      >> $@
 	$(Q)echo "#endif /* BUILD_H */" >> $@
 
+# Allow command-line override for cross-compilation environments where
+# $(shell) may not invoke the host linker correctly.
+ifndef BUILD_ID_NONE
 BUILD_ID_NONE := $(shell if ld --build-id=none --version >/dev/null 2>&1; then echo ',--build-id=none'; fi)
+endif
 
 ######################################################################
 # Build rules
 
-COMPILE = $($(quiet)CC) $(CPPFLAGS) $(CFLAGS) -MD -c $(SRC)$< -o $@
+# Use $< instead of $(SRC)$< because VPATH already resolves source paths.
+# $(SRC)$< duplicates the prefix in out-of-tree builds.
+COMPILE = $($(quiet)CC) $(CPPFLAGS) $(CFLAGS) -MD -c $< -o $@
 LINK    = $($(quiet)LD) -o $@ $^ $(LDFLAGS)
 
 OBJIFY = $($(quiet)GEN)									\
@@ -186,7 +200,20 @@ proot: $(OBJECTS)
 
 # Special case to compute which files depend on the auto-generated
 # file "build.h".
-USE_BUILD_H := $(patsubst $(SRC)%.c,%.o,$(shell egrep -sl 'include[[:space:]]+"build.h"' $(patsubst %.o,$(SRC)%.c,$(OBJECTS))))
+# Use "grep -E" instead of "egrep": on MSYS2/Git-for-Windows, egrep is a
+# shell script (#!/bin/sh + exec grep -E) whose shebang can resolve to a
+# path with spaces, breaking $(shell) on native-Windows make.
+# Use "ifndef" guard: ezwinports make's $(shell) bypasses SHELL and calls
+# CreateProcess directly for "simple" commands. The regex pattern contains
+# double quotes ('"build.h"') which make escapes as \" in the flat Windows
+# command line. MSYS2's command line parser treats \" as a quote-open
+# (not a literal "), causing all subsequent arguments (file paths) to be
+# absorbed into the pattern argv. grep then has no file arguments, reads
+# stdin, and deadlocks against make's unwritten pipe.
+# The build script pre-computes this value instead.
+ifndef USE_BUILD_H
+USE_BUILD_H := $(patsubst $(SRC)%.c,%.o,$(shell grep -E -sl 'include[[:space:]]+"build.h"' $(patsubst %.o,$(SRC)%.c,$(OBJECTS))))
+endif
 $(USE_BUILD_H): build.h
 
 %.o: %.c
@@ -199,11 +226,18 @@ cli/%-licenses.o: licenses cli/cli.o
 ######################################################################
 # Build rules for the loader
 
+# Auto-detect arch-specific values for the main (64-bit) loader.
+# Allow command-line override for cross-compilation environments where
+# $(shell $(CC) -E ...) does not work with the host make's shell.
+ifndef LOADER_ARCH_CFLAGS
+$(eval $(call define_from_arch.h,,LOADER_ARCH_CFLAGS))
+endif
+ifndef LOADER_ADDRESS
+$(eval $(call define_from_arch.h,,LOADER_ADDRESS))
+endif
+
 define build_loader
 LOADER$1_OBJECTS = loader/loader$1.o loader/assembly$1.o
-
-$(eval $(call define_from_arch.h,$1,LOADER_ARCH_CFLAGS))
-$(eval $(call define_from_arch.h,$1,LOADER_ADDRESS))
 
 LOADER_CFLAGS$1  += -fPIC -ffreestanding $(LOADER_ARCH_CFLAGS$1)
 LOADER_LDFLAGS$1 += -static -nostdlib -Wl$(BUILD_ID_NONE),-Ttext=$(LOADER_ADDRESS$1),--rosegment,-z,noexecstack
@@ -231,19 +265,53 @@ endef
 $(eval $(build_loader))
 
 ifdef HAS_LOADER_32BIT
-$(eval $(call build_loader,-m32))
+# CC32: compiler for 32-bit loader. For GCC, defaults to "$(CC) -m32".
+# For NDK clang, set CC32 to the 32-bit target compiler (e.g.
+# armv7a-linux-androideabi28-clang) and CC32_FLAG to empty.
+CC32 ?= $(CC)
+CC32_FLAG ?= -m32
+LD32 = $(CC32)
+LOADER_32_OBJECTS = loader/loader-m32.o loader/assembly-m32.o
+
+# Use CC32+CC32_FLAG (not CC -m32) for arch detection so NDK clang works.
+# Allow command-line override for cross-compilation environments.
+ifndef LOADER_ADDRESS-m32
+LOADER_ADDRESS-m32 := $(shell $(CC32) $(CC32_FLAG) -E -dM -DNO_LIBC_HEADER $(VPATH)/arch.h | grep -w LOADER_ADDRESS | cut -f 3 -d ' ')
+endif
+
+LOADER_CFLAGS-m32  += -fPIC -ffreestanding
+LOADER_LDFLAGS-m32 += -static -nostdlib -Wl$(BUILD_ID_NONE),-Ttext=$(LOADER_ADDRESS-m32),--rosegment,-z,noexecstack
+
+loader/loader-m32.o: loader/loader.c
+	@mkdir -p $(dir $@)
+	$(CC32) $(CPPFLAGS) $(CFLAGS) $(CC32_FLAG) -MD -c $< -o $@ $(LOADER_CFLAGS-m32)
+
+loader/assembly-m32.o: loader/assembly.S
+	@mkdir -p $(dir $@)
+	$(CC32) $(CPPFLAGS) $(CFLAGS) $(CC32_FLAG) -MD -c $< -o $@ $(LOADER_CFLAGS-m32)
+
+loader/loader-m32: $(LOADER_32_OBJECTS)
+	$(LD32) $(CC32_FLAG) -o $@ $^ $(LOADER_LDFLAGS-m32)
+
+.INTERMEDIATE: loader-m32.exe
+loader-m32.exe: loader/loader-m32
+	$(Q)cp $< $@
+	$(Q)$(STRIP) $@
+
+loader/loader-m32-wrapped.o: loader-m32.exe cli/cli.o
+	$(OBJIFY)
 endif
 
 loader/loader-info.c: loader/loader
-	readelf -s $< | awk -f loader/loader-info.awk > $@
+	$(READELF) -s $< | awk -f $(VPATH)/loader/loader-info.awk > $@
 
 ######################################################################
 # Dependencies
 
 .DELETE_ON_ERROR:
-$(OBJECTS) $(LOADER_OBJECTS) $(LOADER-m32_OBJECTS): $(firstword $(MAKEFILE_LIST))
+$(OBJECTS) $(LOADER_OBJECTS) $(LOADER_32_OBJECTS): $(firstword $(MAKEFILE_LIST))
 
-DEPS = $(OBJECTS:.o=.d) $(LOADER_OBJECTS:.o=.d) $(LOADER-m32_OBJECTS:.o=.d) $(CHECK_OBJECTS:.o=.d)
+DEPS = $(OBJECTS:.o=.d) $(LOADER_OBJECTS:.o=.d) $(LOADER_32_OBJECTS:.o=.d) $(CHECK_OBJECTS:.o=.d)
 -include $(DEPS)
 
 ######################################################################
@@ -254,7 +322,7 @@ BINDIR ?= $(PREFIX)/bin
 
 .PHONY: clean distclean install uninstall
 clean distclean:
-	-$(RM) -f $(CHECK_OBJECTS) $(CHECK_PROGRAMS) $(CHECK_RESULTS) $(OBJECTS) $(LOADER_OBJECTS) $(LOADER-m32_OBJECTS) proot loader/loader loader/loader-m32 $(DEPS) build.h licenses
+	-$(RM) -f $(CHECK_OBJECTS) $(CHECK_PROGRAMS) $(CHECK_RESULTS) $(OBJECTS) $(LOADER_OBJECTS) $(LOADER_32_OBJECTS) proot loader/loader loader/loader-m32 $(DEPS) build.h licenses
 
 install: proot
 	$($(quiet)INSTALL) -D $< $(DESTDIR)$(BINDIR)/$<
