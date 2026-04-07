@@ -204,6 +204,30 @@ void translate_syscall(Tracee *tracee)
 		if (tracee->chain.syscalls == NULL || tracee->chain.sysnum_workaround_state == SYSNUM_WORKAROUND_PROCESS_REPLACED_CALL) {
 			tracee->chain.sysnum_workaround_state = SYSNUM_WORKAROUND_INACTIVE;
 			translate_syscall_exit(tracee);
+
+			/* 仅调试用: log mmap -EFAULT. Previous round confirmed:
+			 * proot is transparent for mmap, -EFAULT comes from kernel,
+			 * /proc/PID/maps shows address is unoccupied.
+			 * Maps dump removed — no longer needed. */
+			{
+				Sysnum sn = get_sysnum(tracee, ORIGINAL);
+				if (sn == PR_mmap) {
+					word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+					if (result == (word_t)(-EFAULT)) {
+						note(tracee, WARNING, INTERNAL,
+							"mmap -EFAULT: addr=0x%lx len=0x%lx "
+							"prot=0x%lx flags=0x%lx fd=%ld "
+							"offset=0x%lx pid=%d",
+							(unsigned long)peek_reg(tracee, ORIGINAL, SYSARG_1),
+							(unsigned long)peek_reg(tracee, ORIGINAL, SYSARG_2),
+							(unsigned long)peek_reg(tracee, ORIGINAL, SYSARG_3),
+							(unsigned long)peek_reg(tracee, ORIGINAL, SYSARG_4),
+							(long)peek_reg(tracee, ORIGINAL, SYSARG_5),
+							(unsigned long)peek_reg(tracee, ORIGINAL, SYSARG_6),
+							tracee->pid);
+					}
+				}
+			}
 		}
 		else if (tracee->chain.sysnum_workaround_state == SYSNUM_WORKAROUND_PROCESS_FAULTY_CALL) {
 			tracee->chain.sysnum_workaround_state = SYSNUM_WORKAROUND_PROCESS_REPLACED_CALL;

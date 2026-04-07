@@ -114,12 +114,14 @@ int launch_process(Tracee *tracee, char *const argv[])
 	return -ENOSYS;
 }
 
+static int last_exit_status = -1;
+
 /* Send the KILL signal to all tracees when PRoot has received a fatal
  * signal.  */
 static void kill_all_tracees2(int signum, siginfo_t *siginfo UNUSED, void *ucontext UNUSED)
 {
-	note(NULL, WARNING, INTERNAL, "signal %d received from process %d",
-		signum, siginfo->si_pid);
+	note(NULL, WARNING, INTERNAL, "proot received fatal signal %d from pid %d (uid %d, code %d), last_exit_status=%d",
+		signum, siginfo->si_pid, siginfo->si_uid, siginfo->si_code, last_exit_status);
 	kill_all_tracees();
 
 	/* Exit immediately for system signals (segmentation fault,
@@ -209,8 +211,6 @@ static void print_talloc_hierarchy(int signum, siginfo_t *siginfo UNUSED, void *
 		break;
 	}
 }
-
-static int last_exit_status = -1;
 
 /**
  * Check if this instance of PRoot can *technically* handle @tracee.
@@ -359,6 +359,7 @@ int event_loop()
 		(void) restart_tracee(tracee, signal);
 	}
 
+	note(NULL, WARNING, INTERNAL, "event loop exiting, final exit status: %d", last_exit_status);
 	return last_exit_status;
 }
 
@@ -405,16 +406,37 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 
 	if (WIFEXITED(tracee_status)) {
 		last_exit_status = WEXITSTATUS(tracee_status);
-		VERBOSE(tracee, 1,
-			"vpid %" PRIu64 ": exited with status %d",
-			tracee->vpid, last_exit_status);
+		/* Diagnostic: always log root tracee exit, verbose-only for children */
+		if (tracee->vpid == 1)
+			note(tracee, WARNING, INTERNAL,
+				"root tracee (pid %d) exited with status %d",
+				tracee->pid, last_exit_status);
+		else
+			VERBOSE(tracee, 1,
+				"vpid %" PRIu64 ": exited with status %d",
+				tracee->vpid, last_exit_status);
 		terminate_tracee(tracee);
 	}
 	else if (WIFSIGNALED(tracee_status)) {
+		int termsig = WTERMSIG(tracee_status);
 		check_architecture(tracee);
-		VERBOSE(tracee, (int) (tracee->vpid != 1),
-			"vpid %" PRIu64 ": terminated with signal %d",
-			tracee->vpid, WTERMSIG(tracee_status));
+		/* Only the root tracee (vpid 1) should determine proot's exit
+		 * code. Child tracees killed during cleanup (e.g. SIGKILL after
+		 * root exits) must not overwrite it — upstream never set
+		 * last_exit_status in WIFSIGNALED at all, and blindly doing so
+		 * causes proot to return 137 when children are reaped. */
+		if (tracee->vpid == 1) {
+			last_exit_status = 128 + termsig;
+			note(tracee, WARNING, INTERNAL,
+				"root tracee (pid %d) killed by signal %d, "
+				"effective exit status %d",
+				tracee->pid, termsig, last_exit_status);
+		} else {
+			note(tracee, WARNING, INTERNAL, // 仅调试用
+				"vpid %" PRIu64 " (pid %d) killed by signal %d "
+				"(not overwriting last_exit_status=%d)",
+				tracee->vpid, tracee->pid, termsig, last_exit_status);
+		}
 		terminate_tracee(tracee);
 	}
 	else if (WIFSTOPPED(tracee_status)) {
@@ -669,6 +691,11 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 		}
 
 		default:
+			/* Diagnostic: log real-time signals (e.g. signal 54 = exit code 182) */
+			if (signal >= 32)
+				note(tracee, WARNING, INTERNAL,
+					"vpid %" PRIu64 " (pid %d): delivering RT signal %d",
+					tracee->vpid, tracee->pid, signal);
 			/* Deliver this signal as-is,
 			 * unless we're chaining syscall.  */
 			if (tracee->chain.syscalls != NULL || tracee->restore_original_regs_after_seccomp_event) {

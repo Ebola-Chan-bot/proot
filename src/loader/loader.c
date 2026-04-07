@@ -43,12 +43,37 @@
 #    define MMAP_OFFSET_SHIFT 0
 #endif
 
+/* _STR / _XSTR: stringify macro for embedding __LINE__ in static strings. */ /* 仅调试用 */
+#define _STR(x) #x /* 仅调试用 */
+#define _XSTR(x) _STR(x) /* 仅调试用 */
+
+/* Write a diagnostic message to stderr (fd 2) before exiting 182.
+ * This distinguishes loader FATAL() from signal-54-killed processes,
+ * since both produce $?=182 in the parent shell. */
 #define FATAL() do {						\
+		static const char _fatal_msg[] =		\
+			"[loader:FATAL,line=" _XSTR(__LINE__) "]\n"; /* 仅调试用 */ \
+		SYSCALL(WRITE, 3, 2,				\
+			(word_t)_fatal_msg,			\
+			sizeof(_fatal_msg) - 1);		/* 仅调试用 */ \
 		SYSCALL(EXIT, 1, 182);				\
 		__builtin_unreachable();			\
 	} while (0)
 
 #define unlikely(expr) __builtin_expect(!!(expr), 0)
+
+/* Write a word_t value as 16-char hex string to stderr. No libc needed. */ /* 仅调试用 */
+static inline void _write_hex(word_t v) /* 仅调试用 */
+{ /* 仅调试用 */
+	char buf[16]; /* 仅调试用 */
+	int i; /* 仅调试用 */
+	for (i = 15; i >= 0; i--) { /* 仅调试用 */
+		int n = v & 0xf; /* 仅调试用 */
+		buf[i] = n < 10 ? '0' + n : 'a' + n - 10; /* 仅调试用 */
+		v >>= 4; /* 仅调试用 */
+	} /* 仅调试用 */
+	SYSCALL(WRITE, 3, 2, (word_t)buf, 16); /* 仅调试用 */
+} /* 仅调试用 */
 
 /**
  * Clear the memory from @start (inclusive) to @end (exclusive).
@@ -145,8 +170,68 @@ void _start(void *cursor)
 			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
 					stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED, fd,
 					stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
-			if (unlikely(status != stmt->mmap.addr))
+			if (unlikely(status != stmt->mmap.addr)) {
+				/* mmap returned unexpected addr; dump exp/got/len/fd for diagnosis */ /* 仅调试用 */
+				static const char _h1[] = "[loader:mmap-fail,exp="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_h1, sizeof(_h1) - 1); /* 仅调试用 */
+				_write_hex(stmt->mmap.addr); /* 仅调试用 */
+				static const char _h2[] = ",got="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_h2, sizeof(_h2) - 1); /* 仅调试用 */
+				_write_hex(status); /* 仅调试用 */
+				static const char _h3[] = ",len="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_h3, sizeof(_h3) - 1); /* 仅调试用 */
+				_write_hex(stmt->mmap.length); /* 仅调试用 */
+				static const char _h4[] = ",fd="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_h4, sizeof(_h4) - 1); /* 仅调试用 */
+				_write_hex(fd); /* 仅调试用 */
+				static const char _h5[] = "]\n"; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_h5, sizeof(_h5) - 1); /* 仅调试用 */
+
+				/* Probe MAP_FIXED at multiple addresses to find the kernel's
+				 * accepted/rejected boundary. Previous round confirmed:
+				 * - 0x3000000000 persistently -EFAULT (not transient)
+				 * - Same mmap without MAP_FIXED succeeds (fd/prot OK)
+				 * - /proc/PID/maps shows 0x3000000000 is unoccupied
+				 * - vdso/kshare at ~0x2fa1c3XXXX, only ~1.5GB below target
+				 * Hypothesis: Huawei kernel restricts MAP_FIXED near vdso.
+				 * Test addresses: 0x21-0x50 (×2^32) to map the boundary. */ /* 仅调试用 */
+				{ /* 仅调试用 */
+					/* Test addresses from 0x2100000000 to 0x5000000000 */ /* 仅调试用 */
+					static const word_t test_addrs[] = { /* 仅调试用 */
+						0x2100000000UL, /* 132 GB — just above loader */ /* 仅调试用 */
+						0x2800000000UL, /* 160 GB — midpoint */ /* 仅调试用 */
+						0x2e00000000UL, /* 184 GB — below vdso */ /* 仅调试用 */
+						0x2f00000000UL, /* 188 GB — closer to vdso */ /* 仅调试用 */
+						0x2f80000000UL, /* 190 GB — very near vdso */ /* 仅调试用 */
+						0x3000000000UL, /* 192 GB — EXEC_PIC_ADDRESS (known fail) */ /* 仅调试用 */
+						0x3100000000UL, /* 196 GB — above target */ /* 仅调试用 */
+						0x4000000000UL, /* 256 GB — well above */ /* 仅调试用 */
+						0x5000000000UL, /* 320 GB — much higher */ /* 仅调试用 */
+					}; /* 仅调试用 */
+					word_t page_sz = 0x1000; /* 仅调试用 */
+					int ti; /* 仅调试用 */
+					for (ti = 0; ti < 9; ti++) { /* 仅调试用 */
+						word_t taddr = test_addrs[ti]; /* 仅调试用 */
+						word_t tret = SYSCALL(MMAP, 6, taddr, page_sz, /* 仅调试用 */
+								0x3 /* PROT_READ|PROT_WRITE */, /* 仅调试用 */
+								MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, /* 仅调试用 */
+								-1, 0); /* 仅调试用 */
+						static const char _t1[] = "[loader:addr-probe,addr="; /* 仅调试用 */
+						SYSCALL(WRITE, 3, 2, (word_t)_t1, sizeof(_t1) - 1); /* 仅调试用 */
+						_write_hex(taddr); /* 仅调试用 */
+						static const char _t2[] = ",got="; /* 仅调试用 */
+						SYSCALL(WRITE, 3, 2, (word_t)_t2, sizeof(_t2) - 1); /* 仅调试用 */
+						_write_hex(tret); /* 仅调试用 */
+						static const char _t3[] = "]\n"; /* 仅调试用 */
+						SYSCALL(WRITE, 3, 2, (word_t)_t3, sizeof(_t3) - 1); /* 仅调试用 */
+						/* Unmap if successful to keep address space clean */ /* 仅调试用 */
+						if (tret == taddr) /* 仅调试用 */
+							SYSCALL(MUNMAP, 3, tret, page_sz, 0); /* 仅调试用 */
+					} /* 仅调试用 */
+				} /* 仅调试用 */
+
 				FATAL();
+			}
 
 			if (stmt->mmap.clear_length != 0)
 				clear(stmt->mmap.addr + stmt->mmap.length - stmt->mmap.clear_length,
@@ -163,8 +248,21 @@ void _start(void *cursor)
 		case LOAD_ACTION_MMAP_ANON:
 			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
 					stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
-			if (unlikely(status != stmt->mmap.addr))
+			if (unlikely(status != stmt->mmap.addr)) {
+				/* anon mmap returned unexpected addr */ /* 仅调试用 */
+				static const char _a1[] = "[loader:mmap-anon-fail,exp="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_a1, sizeof(_a1) - 1); /* 仅调试用 */
+				_write_hex(stmt->mmap.addr); /* 仅调试用 */
+				static const char _a2[] = ",got="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_a2, sizeof(_a2) - 1); /* 仅调试用 */
+				_write_hex(status); /* 仅调试用 */
+				static const char _a3[] = ",len="; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_a3, sizeof(_a3) - 1); /* 仅调试用 */
+				_write_hex(stmt->mmap.length); /* 仅调试用 */
+				static const char _a4[] = "]\n"; /* 仅调试用 */
+				SYSCALL(WRITE, 3, 2, (word_t)_a4, sizeof(_a4) - 1); /* 仅调试用 */
 				FATAL();
+			}
 
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
 			break;
