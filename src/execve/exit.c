@@ -28,6 +28,7 @@
 #include <strings.h>    /* bzero(3), */
 #include <signal.h>     /* kill(2), SIG*, */
 #include <unistd.h>     /* write(2), */
+#include <stdio.h>      /* fopen(3), fgets(3), fclose(3), sscanf(3), snprintf(3), */
 #include <errno.h>      /* E*, */
 
 #include "execve/execve.h"
@@ -398,6 +399,230 @@ static int transfer_load_script(Tracee *tracee)
  * Start the loading of @tracee.  This function returns no error since
  * it's either too late to do anything useful (the calling process is
  * already replaced) or the error reported by the kernel
+
+ * Address conflict detection and relocation for PIE binaries.
+ *
+ * The original code uses hardcoded EXEC_PIC_ADDRESS / INTERP_PIC_ADDRESS
+ * as the load base for position-independent executables and interpreters.
+ * On some Android devices (notably Huawei), kernel mappings (vdso, kshare)
+ * land near these addresses, causing the loader's MAP_FIXED to fail with
+ * -EFAULT and exit 182.
+ *
+ * The fix: after the loader is exec'd (but before it runs), read the
+ * tracee's /proc/PID/maps to discover occupied regions, and relocate
+ * any PIE binary whose planned range overlaps.
+ */
+
+typedef struct {
+	word_t start;
+	word_t end;
+} MemRegion;
+
+#define MAX_REGIONS 128
+
+/**
+ * Read /proc/@pid/maps and collect all occupied memory regions.
+ * Returns the number of regions, or -1 on error.
+ */
+static int parse_tracee_maps(pid_t pid, MemRegion *regions, int max_regions)
+{
+	char path[64];
+	FILE *maps;
+	int count = 0;
+
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	maps = fopen(path, "r");
+	if (maps == NULL)
+		return -1;
+
+	char line[256];
+	while (fgets(line, sizeof(line), maps) && count < max_regions) {
+		unsigned long map_start, map_end;
+		if (sscanf(line, "%lx-%lx", &map_start, &map_end) == 2) {
+			regions[count].start = map_start;
+			regions[count].end = map_end;
+			count++;
+		}
+	}
+	fclose(maps);
+	return count;
+}
+
+/**
+ * Check if [@start, @start + @size) overlaps with any region in
+ * @regions[0..@count), or with [@extra_start, @extra_end) if
+ * @extra_end > 0.
+ */
+static bool range_has_conflict(const MemRegion *regions, int count,
+			word_t start, word_t size,
+			word_t extra_start, word_t extra_end)
+{
+	word_t end = start + size;
+	int i;
+
+	for (i = 0; i < count; i++) {
+		if (start < regions[i].end && end > regions[i].start)
+			return true;
+	}
+
+	if (extra_end > 0 && start < extra_end && end > extra_start)
+		return true;
+
+	return false;
+}
+
+/**
+ * Find a free address range of @size bytes that avoids all @regions
+ * and the optional extra range.  Search starts from @hint upward,
+ * aligned to @align (must be a power of 2).
+ * Returns the base address, or 0 on failure.
+ */
+static word_t find_free_range(const MemRegion *regions, int count,
+			word_t size, word_t hint, word_t align,
+			word_t extra_start, word_t extra_end)
+{
+	/* Merge regions + extra into a sorted list of obstacles. */
+	MemRegion sorted[MAX_REGIONS + 1];
+	int n = 0;
+	int i, j;
+	word_t candidate;
+
+	for (i = 0; i < count && n < MAX_REGIONS; i++)
+		sorted[n++] = regions[i];
+	if (extra_end > 0 && n < MAX_REGIONS + 1) {
+		sorted[n].start = extra_start;
+		sorted[n].end = extra_end;
+		n++;
+	}
+
+	/* Insertion sort by start address (n is small). */
+	for (i = 1; i < n; i++) {
+		MemRegion key = sorted[i];
+		j = i - 1;
+		while (j >= 0 && sorted[j].start > key.start) {
+			sorted[j + 1] = sorted[j];
+			j--;
+		}
+		sorted[j + 1] = key;
+	}
+
+	candidate = (hint + align - 1) & ~(align - 1);
+
+	for (i = 0; i < n; i++) {
+		if (candidate + size <= sorted[i].start)
+			return candidate;
+		if (candidate < sorted[i].end)
+			candidate = (sorted[i].end + align - 1) & ~(align - 1);
+	}
+
+	/* After all obstacles; check for overflow. */
+	if (candidate + size > candidate)
+		return candidate;
+
+	return 0;
+}
+
+/**
+ * Relocate all mapping addresses and the ELF entry point of
+ * @load_info by @delta.
+ */
+static void relocate_load_info(LoadInfo *load_info, word_t delta)
+{
+	size_t nb_mappings = talloc_array_length(load_info->mappings);
+	size_t i;
+
+	for (i = 0; i < nb_mappings; i++)
+		load_info->mappings[i].addr += delta;
+
+	if (IS_CLASS64(load_info->elf_header))
+		load_info->elf_header.class64.e_entry += delta;
+	else
+		load_info->elf_header.class32.e_entry += delta;
+}
+
+/**
+ * Check planned load addresses for PIE binaries against the tracee's
+ * actual memory layout (post-execve of the loader).  Relocate any
+ * binary whose range overlaps with existing mappings (loader text,
+ * vdso, kshare, stack, etc.).
+ *
+ * Called from translate_execve_exit() before the load script is built,
+ * so all address adjustments propagate cleanly into the script and
+ * auxiliary vectors.
+ */
+static void fixup_load_addresses(Tracee *tracee)
+{
+	MemRegion regions[MAX_REGIONS];
+	int count;
+	/* 64 KB alignment: large-page-friendly and avoids wasting low
+	 * granularity bits that some kernels may reject. */
+	const word_t align = 0x10000;
+	word_t exe_start = 0, exe_end = 0;
+
+	count = parse_tracee_maps(tracee->pid, regions, MAX_REGIONS);
+	if (count <= 0)
+		return;
+
+	/* --- executable --- */
+	if (tracee->load_info->mappings != NULL
+	    && IS_POSITION_INDENPENDANT(tracee->load_info->elf_header)) {
+		size_t nb = talloc_array_length(tracee->load_info->mappings);
+		word_t start = tracee->load_info->mappings[0].addr;
+		word_t end   = tracee->load_info->mappings[nb - 1].addr
+			     + tracee->load_info->mappings[nb - 1].length;
+		word_t size  = end - start;
+
+		if (range_has_conflict(regions, count, start, size, 0, 0)) {
+			word_t new_base = find_free_range(
+				regions, count, size, start, align, 0, 0);
+			if (new_base != 0 && new_base != start) {
+				note(tracee, INFO, INTERNAL,
+					"relocating PIE executable: %lx -> %lx "
+					"(address conflict in tracee maps)",
+					(unsigned long) start,
+					(unsigned long) new_base);
+				relocate_load_info(tracee->load_info,
+						new_base - start);
+			}
+		}
+
+		/* Record the (possibly relocated) exe range so the
+		 * interpreter doesn't land on top of it. */
+		nb = talloc_array_length(tracee->load_info->mappings);
+		exe_start = tracee->load_info->mappings[0].addr;
+		exe_end   = tracee->load_info->mappings[nb - 1].addr
+			  + tracee->load_info->mappings[nb - 1].length;
+	}
+
+	/* --- interpreter --- */
+	if (tracee->load_info->interp != NULL
+	    && tracee->load_info->interp->mappings != NULL
+	    && IS_POSITION_INDENPENDANT(tracee->load_info->interp->elf_header)) {
+		size_t nb = talloc_array_length(tracee->load_info->interp->mappings);
+		word_t start = tracee->load_info->interp->mappings[0].addr;
+		word_t end   = tracee->load_info->interp->mappings[nb - 1].addr
+			     + tracee->load_info->interp->mappings[nb - 1].length;
+		word_t size  = end - start;
+
+		if (range_has_conflict(regions, count, start, size,
+				exe_start, exe_end)) {
+			word_t new_base = find_free_range(
+				regions, count, size, start, align,
+				exe_start, exe_end);
+			if (new_base != 0 && new_base != start) {
+				note(tracee, INFO, INTERNAL,
+					"relocating PIE interpreter: %lx -> %lx "
+					"(address conflict in tracee maps)",
+					(unsigned long) start,
+					(unsigned long) new_base);
+				relocate_load_info(tracee->load_info->interp,
+						new_base - start);
+			}
+		}
+	}
+}
+
+/**
  * (syscall_result < 0) will be propagated as-is.
  */
 void translate_execve_exit(Tracee *tracee)
@@ -487,6 +712,12 @@ void translate_execve_exit(Tracee *tracee)
 	} else {
 		bzero(tracee->heap, sizeof(Heap));
 	}
+
+	/* Relocate PIE load addresses that conflict with the tracee's
+	 * current mappings (loader, vdso, kshare, etc.).  Must run
+	 * before transfer_load_script() which bakes addresses into
+	 * the load script. */
+	fixup_load_addresses(tracee);
 
 	/* Transfer the load script to the loader.  */
 	mem_prepare_after_execve(tracee);
