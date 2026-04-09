@@ -432,7 +432,7 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 				"effective exit status %d",
 				tracee->pid, termsig, last_exit_status);
 		} else {
-			note(tracee, WARNING, INTERNAL, // 仅调试用
+			VERBOSE(tracee, 1,
 				"vpid %" PRIu64 " (pid %d) killed by signal %d "
 				"(not overwriting last_exit_status=%d)",
 				tracee->vpid, tracee->pid, termsig, last_exit_status);

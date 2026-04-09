@@ -140,9 +140,12 @@ static int bind_proc_pid_auxv(const Tracee *ptracee)
 
 /**
  * Convert @mappings into load @script statements at the given @cursor
- * position.  This function returns the new cursor position.
+ * position.  When @is_pic is true the PIE action variants are used so the
+ * loader can allocate a safe base address at runtime instead of relying on
+ * the hardcoded EXEC_PIC_ADDRESS / INTERP_PIC_ADDRESS constants.
+ * This function returns the new cursor position.
  */
-static void *transcript_mappings(void *cursor, const Mapping *mappings)
+static void *transcript_mappings(void *cursor, const Mapping *mappings, bool is_pic)
 {
 	size_t nb_mappings;
 	size_t i;
@@ -152,9 +155,9 @@ static void *transcript_mappings(void *cursor, const Mapping *mappings)
 		LoadStatement *statement = cursor;
 
 		if ((mappings[i].flags & MAP_ANONYMOUS) != 0)
-			statement->action = LOAD_ACTION_MMAP_ANON;
+			statement->action = is_pic ? LOAD_ACTION_MMAP_PIC_ANON : LOAD_ACTION_MMAP_ANON;
 		else
-			statement->action = LOAD_ACTION_MMAP_FILE;
+			statement->action = is_pic ? LOAD_ACTION_MMAP_PIC_FILE : LOAD_ACTION_MMAP_FILE;
 
 		statement->mmap.addr   = mappings[i].addr;
 		statement->mmap.length = mappings[i].length;
@@ -209,7 +212,9 @@ static int transfer_load_script(Tracee *tracee)
 	needs_executable_stack = (tracee->load_info->needs_executable_stack
 				|| (   tracee->load_info->interp != NULL
 				    && tracee->load_info->interp->needs_executable_stack));
-
+	bool exec_is_pic = IS_POSITION_INDENPENDANT(tracee->load_info->elf_header);
+	bool interp_is_pic = tracee->load_info->interp != NULL
+			  && IS_POSITION_INDENPENDANT(tracee->load_info->interp->elf_header);
 	/* Strings addresses are required to generate the load script,
 	 * for "open" actions.  Since I want to generate it in one
 	 * pass, these strings will be put right below the current
@@ -270,7 +275,7 @@ static int transfer_load_script(Tracee *tracee)
 	cursor += LOAD_STATEMENT_SIZE(*statement, open);
 
 	/* Load script statements: mmap.  */
-	cursor = transcript_mappings(cursor, tracee->load_info->mappings);
+	cursor = transcript_mappings(cursor, tracee->load_info->mappings, exec_is_pic);
 
 	if (tracee->load_info->interp != NULL) {
 		/* Load script statement: open.  */
@@ -281,7 +286,7 @@ static int transfer_load_script(Tracee *tracee)
 		cursor += LOAD_STATEMENT_SIZE(*statement, open);
 
 		/* Load script statements: mmap.  */
-		cursor = transcript_mappings(cursor, tracee->load_info->interp->mappings);
+		cursor = transcript_mappings(cursor, tracee->load_info->interp->mappings, interp_is_pic);
 
 		entry_point = ELF_FIELD(tracee->load_info->interp->elf_header, entry);
 	}
@@ -562,6 +567,84 @@ static void fixup_load_addresses(Tracee *tracee)
 	count = parse_tracee_maps(tracee->pid, regions, MAX_REGIONS);
 	if (count <= 0)
 		return;
+
+	/* Some Android kernels (notably Huawei) enforce a hidden protection
+	 * zone around vdso/kshare that isn't visible in /proc/PID/maps.
+	 * MAP_FIXED into this zone returns -EFAULT even though no mapping
+	 * is listed there.  Work around: find any [vdso] or [kshare]
+	 * region, then expand it by ±4 GB as a synthetic obstacle so
+	 * find_free_range() will skip the entire dangerous area.
+	 *
+	 * This was the root cause of exit 182 on Huawei ARM64:
+	 * EXEC_PIC_ADDRESS (0x3000000000) fell within ~1.5 GB of vdso
+	 * (ASLR @ ~0x2fa1cXXXXX), inside the kernel's protection zone. */
+	int vdso_guard_count = 0;
+	MemRegion vdso_guards[2];  /* room for up to 2 synthetic obstacles */
+	{
+		int i;
+		/* 4 GB guard band — empirically sufficient based on Huawei
+		 * ALN-AL10 (Android 12, kernel 5.10) testing where vdso at
+		 * ~0x2fa1c32000 and 0x3000000000 (~1.5 GB away) always fails. */
+		const word_t guard_band = 0x100000000UL;  /* 4 GB */
+		for (i = 0; i < count; i++) {
+			/* Identify kernel special mappings by scanning the maps
+			 * path.  We re-read the file to get names (parse_tracee_maps
+			 * only stores start/end).  Instead, just check if any
+			 * region is in the typical vdso/kshare address range
+			 * (0x20_0000_0000 .. 0x40_0000_0000 on ARM64) and is
+			 * small (<1MB) — a cheap heuristic that avoids re-parsing. */
+		}
+		/* Re-read maps once more to detect [vdso] / [kshare] by name. */
+		{
+			char path[64];
+			FILE *maps;
+			char line[256];
+			snprintf(path, sizeof(path), "/proc/%d/maps",
+				 tracee->pid);
+			maps = fopen(path, "r");
+			if (maps != NULL) {
+				word_t vdso_lo = (word_t)-1, vdso_hi = 0;
+				while (fgets(line, sizeof(line), maps)) {
+					unsigned long ms, me;
+					if (sscanf(line, "%lx-%lx", &ms, &me) != 2)
+						continue;
+					/* Check for [vdso], [kshare], or any
+					 * bracket-named kernel mapping. */
+					if (strstr(line, "[vdso]") ||
+					    strstr(line, "[kshare]")) {
+						if ((word_t)ms < vdso_lo)
+							vdso_lo = (word_t)ms;
+						if ((word_t)me > vdso_hi)
+							vdso_hi = (word_t)me;
+					}
+				}
+				fclose(maps);
+
+				if (vdso_hi > 0) {
+					word_t guard_lo = vdso_lo > guard_band
+						? vdso_lo - guard_band : 0;
+					word_t guard_hi = vdso_hi + guard_band;
+					/* Avoid overflow */
+					if (guard_hi < vdso_hi)
+						guard_hi = (word_t)-1;
+					vdso_guards[0].start = guard_lo;
+					vdso_guards[0].end = guard_hi;
+					vdso_guard_count = 1;
+					note(tracee, INFO, INTERNAL,
+						"vdso guard zone: %lx-%lx "
+						"(vdso at %lx-%lx, ±%lu GB band)",
+						(unsigned long)guard_lo,
+						(unsigned long)guard_hi,
+						(unsigned long)vdso_lo,
+						(unsigned long)vdso_hi,
+						(unsigned long)(guard_band >> 30));
+				}
+			}
+		}
+		/* Append synthetic vdso guard regions to the regions array. */
+		for (i = 0; i < vdso_guard_count && count < MAX_REGIONS; i++)
+			regions[count++] = vdso_guards[i];
+	}
 
 	/* --- executable --- */
 	if (tracee->load_info->mappings != NULL

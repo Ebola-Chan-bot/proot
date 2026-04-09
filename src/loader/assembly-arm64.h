@@ -91,8 +91,6 @@
 
 #define OPENAT	56
 #define CLOSE	57
-#define WRITE	64 /* 仅调试用 */
-#define MUNMAP	215 /* 仅调试用 */
 #define MMAP	222
 #define EXECVE	221
 #define EXIT	93
