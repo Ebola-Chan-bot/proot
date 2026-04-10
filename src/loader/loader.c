@@ -113,15 +113,7 @@ void _start(void *cursor)
 	bool traced = false;
 	bool reset_at_base = true;
 	word_t at_base = 0;
-	/* Delta between the expected (script) base and the actual kernel-assigned
-	 * base for the current file.  Set on the first MMAP_PIC_FILE of each
-	 * file and reset on OPEN/OPEN_NEXT.  Non-PIE files leave this at 0. */
-	word_t base_delta = 0;
-	/* Saved delta for the exec binary.  Used to adjust AT_ENTRY and AT_PHDR
-	 * in the START statement, which are exec-relative even when a separate
-	 * interpreter is present. */
-	word_t exec_base_delta = 0;
-	bool exec_delta_set = false;
+
 
 	word_t fd = -1;
 	word_t status;
@@ -169,52 +161,28 @@ void _start(void *cursor)
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
 			break;
 
-		case LOAD_ACTION_MMAP_PIC_FILE: {
-			/* PIE binary: let the kernel choose a safe base address.
-			 *
-			 * Root cause of exit 182 on Huawei ALN-AL10 (Android 12):
-			 * EXEC_PIC_ADDRESS (0x3000000000) falls inside the kernel's
-			 * ~2 GB vdso protection zone (ASLR-randomized ~0x2fXXXXXXXX).
-			 * mmap(MAP_FIXED, 0x3000000000) returns -EFAULT, loader calls
-			 * FATAL() → exit(182).  The address is unoccupied in
-			 * /proc/PID/maps; the kernel silently rejects it anyway.
-			 *
-			 * Fix: for the first segment of a PIE file omit MAP_FIXED and
-			 * use addr=0 so the kernel picks an address in a region it
-			 * actually allows.  Record the delta (actual − expected) and
-			 * apply it with MAP_FIXED to all subsequent segments of the
-			 * same file, which preserves the required relative layout. */
-			word_t actual_addr;
-			if (reset_at_base) {
-				status = SYSCALL(MMAP, 6, (word_t)0, stmt->mmap.length,
-						stmt->mmap.prot, MAP_PRIVATE, fd,
-						stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
-				if (unlikely((int) status < 0))
-					FATAL();
-				base_delta = status - stmt->mmap.addr;
-				at_base = status;
-				if (!exec_delta_set) {
-					exec_base_delta = base_delta;
-					exec_delta_set = true;
-				}
-				reset_at_base = false;
-				actual_addr = status;
-			} else {
-				actual_addr = stmt->mmap.addr + base_delta;
-				status = SYSCALL(MMAP, 6, actual_addr, stmt->mmap.length,
-						stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED, fd,
-						stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
-				if (unlikely(status != actual_addr))
-					FATAL();
-			}
+		case LOAD_ACTION_MMAP_PIC_FILE:
+			/* PIE binary: use the address that exit.c's fixup_load_addresses()
+			 * pre-selected after scanning /proc/PID/maps and the vdso guard
+			 * zone.  MAP_FIXED is safe here because exit.c already ensured
+			 * the address lies outside all restricted regions. */
+			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
+					stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED, fd,
+					stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
+			if (unlikely(status != stmt->mmap.addr))
+				FATAL();
 
 			if (stmt->mmap.clear_length != 0)
-				clear(actual_addr + stmt->mmap.length - stmt->mmap.clear_length,
-					actual_addr + stmt->mmap.length);
+				clear(stmt->mmap.addr + stmt->mmap.length - stmt->mmap.clear_length,
+					stmt->mmap.addr + stmt->mmap.length);
+
+			if (reset_at_base) {
+				at_base = stmt->mmap.addr;
+				reset_at_base = false;
+			}
 
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
 			break;
-		}
 
 		case LOAD_ACTION_MMAP_ANON:
 			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
@@ -225,18 +193,15 @@ void _start(void *cursor)
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
 			break;
 
-		case LOAD_ACTION_MMAP_PIC_ANON: {
-			/* Anon segment of a PIE binary — apply the same base_delta
-			 * that was computed for the preceding MMAP_PIC_FILE. */
-			word_t actual_addr = stmt->mmap.addr + base_delta;
-			status = SYSCALL(MMAP, 6, actual_addr, stmt->mmap.length,
+		case LOAD_ACTION_MMAP_PIC_ANON:
+			/* Anon segment of a PIE binary — address pre-selected by exit.c. */
+			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
 					stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
-			if (unlikely(status != actual_addr))
+			if (unlikely(status != stmt->mmap.addr))
 				FATAL();
 
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
 			break;
-		}
 
 		case LOAD_ACTION_MAKE_STACK_EXEC:
 			SYSCALL(MPROTECT, 3,
@@ -254,10 +219,10 @@ void _start(void *cursor)
 			word_t *cursor2 = (word_t *) stmt->start.stack_pointer;
 			const word_t argc = cursor2[0];
 			const word_t at_execfn = cursor2[1];
-			/* For PIE binaries entry_point and at_phdr/at_entry were computed
-			 * against the hardcoded EXEC_PIC/INTERP_PIC base.  Shift them to
-			 * the actual kernel-assigned addresses using the recorded deltas. */
-			const word_t actual_entry = stmt->start.entry_point + base_delta;
+			/* entry_point, at_phdr, and at_entry were already adjusted by
+			 * exit.c's relocate_load_info() when the PIE binary was moved
+			 * to a guard-zone-free address.  Use them as-is. */
+			const word_t actual_entry = stmt->start.entry_point;
 			word_t name;
 
 			status = SYSCALL(CLOSE, 1, fd);
@@ -282,7 +247,7 @@ void _start(void *cursor)
 			do {
 				switch (cursor2[0]) {
 				case AT_PHDR:
-					cursor2[1] = stmt->start.at_phdr + exec_base_delta;
+					cursor2[1] = stmt->start.at_phdr;
 					break;
 
 				case AT_PHENT:
@@ -294,7 +259,7 @@ void _start(void *cursor)
 					break;
 
 				case AT_ENTRY:
-					cursor2[1] = stmt->start.at_entry + exec_base_delta;
+					cursor2[1] = stmt->start.at_entry;
 					break;
 
 				case AT_BASE:

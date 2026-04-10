@@ -409,9 +409,8 @@ static int transfer_load_script(Tracee *tracee)
  *
  * The original code uses hardcoded EXEC_PIC_ADDRESS / INTERP_PIC_ADDRESS
  * as the load base for position-independent executables and interpreters.
- * On some Android devices (notably Huawei), kernel mappings (vdso, kshare)
- * land near these addresses, causing the loader's MAP_FIXED to fail with
- * -EFAULT and exit 182.
+ * On some Android devices, kernel mappings (vdso, kshare) land near these
+ * addresses, causing the loader's MAP_FIXED to fail with -EFAULT.
  *
  * The fix: after the loader is exec'd (but before it runs), read the
  * tracee's /proc/PID/maps to discover occupied regions, and relocate
@@ -568,23 +567,19 @@ static void fixup_load_addresses(Tracee *tracee)
 	if (count <= 0)
 		return;
 
-	/* Some Android kernels (notably Huawei) enforce a hidden protection
-	 * zone around vdso/kshare that isn't visible in /proc/PID/maps.
-	 * MAP_FIXED into this zone returns -EFAULT even though no mapping
-	 * is listed there.  Work around: find any [vdso] or [kshare]
-	 * region, then expand it by ±4 GB as a synthetic obstacle so
-	 * find_free_range() will skip the entire dangerous area.
-	 *
-	 * This was the root cause of exit 182 on Huawei ARM64:
-	 * EXEC_PIC_ADDRESS (0x3000000000) fell within ~1.5 GB of vdso
-	 * (ASLR @ ~0x2fa1cXXXXX), inside the kernel's protection zone. */
+	/* Some Android kernels enforce a hidden protection zone around
+	 * vdso/kshare that isn't visible in /proc/PID/maps.  MAP_FIXED
+	 * into this zone returns -EFAULT even though no mapping is listed
+	 * there.  Work around: find any [vdso] or [kshare] region, then
+	 * expand it by ±4 GB as a synthetic obstacle so find_free_range()
+	 * will skip the entire dangerous area. */
 	int vdso_guard_count = 0;
 	MemRegion vdso_guards[2];  /* room for up to 2 synthetic obstacles */
 	{
 		int i;
-		/* 4 GB guard band — empirically sufficient based on Huawei
-		 * ALN-AL10 (Android 12, kernel 5.10) testing where vdso at
-		 * ~0x2fa1c32000 and 0x3000000000 (~1.5 GB away) always fails. */
+		/* 4 GB guard band — empirically determined sufficient; covers
+		 * the observed ~1.5 GB distance between typical vdso addresses
+		 * and EXEC_PIC_ADDRESS on affected ARM64 devices. */
 		const word_t guard_band = 0x100000000UL;  /* 4 GB */
 		for (i = 0; i < count; i++) {
 			/* Identify kernel special mappings by scanning the maps

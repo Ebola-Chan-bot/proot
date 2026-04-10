@@ -691,7 +691,7 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 		}
 
 		default:
-			/* Diagnostic: log real-time signals (e.g. signal 54 = exit code 182) */
+			/* Log delivery of real-time signals (RT signals >= 32). */
 			if (signal >= 32)
 				note(tracee, WARNING, INTERNAL,
 					"vpid %" PRIu64 " (pid %d): delivering RT signal %d",
