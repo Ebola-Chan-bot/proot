@@ -404,6 +404,10 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 	signal = 0;
 
 	if (WIFEXITED(tracee_status)) {
+		/* No vpid==1 guard here (unlike WIFSIGNALED below): this is
+		 * upstream behavior, and normal WIFEXITED ordering has root
+		 * exiting last — there is no bulk-SIGKILL cleanup phase that
+		 * could overwrite the status as with WIFSIGNALED. */
 		last_exit_status = WEXITSTATUS(tracee_status);
 		VERBOSE(tracee, 1,
 			"vpid %" PRIu64 ": exited with status %d",

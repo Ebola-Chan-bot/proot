@@ -178,7 +178,10 @@ void _start(void *cursor)
 				status = SYSCALL(MMAP, 6, 0, stmt->mmap.length,
 						stmt->mmap.prot, MAP_PRIVATE, fd,
 						stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
-				if (unlikely((long) status < 0))
+				/* Use IS_ERR_VALUE-style check: on 32-bit targets,
+				 * valid high addresses (e.g. 0xb7...) look negative
+				 * when cast to long; mmap errors are in [-4095,-1]. */
+				if (unlikely(status >= (word_t)-4095))
 					FATAL();
 				pic_delta = status - stmt->mmap.addr;
 				at_base = status;
@@ -218,7 +221,8 @@ void _start(void *cursor)
 				 * kernel choose the base address. */
 				status = SYSCALL(MMAP, 6, 0, stmt->mmap.length,
 						stmt->mmap.prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-				if (unlikely((long) status < 0))
+				/* IS_ERR_VALUE-style: see LOAD_ACTION_MMAP_PIC_FILE. */
+				if (unlikely(status >= (word_t)-4095))
 					FATAL();
 				pic_delta = status - stmt->mmap.addr;
 				at_base = status;
