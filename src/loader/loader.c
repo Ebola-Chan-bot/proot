@@ -113,7 +113,14 @@ void _start(void *cursor)
 	bool traced = false;
 	bool reset_at_base = true;
 	word_t at_base = 0;
-
+	/* PIE relocation: the first segment of each PIE binary is mapped with
+	 * addr=0 to let the kernel choose a conflict-free base.  pic_delta is
+	 * the difference between the kernel-chosen base and the original
+	 * planned address; it is applied to all subsequent segments and to
+	 * entry_point / auxv values at startup. */
+	word_t pic_delta = 0;
+	word_t exec_pic_delta = 0;
+	bool has_interp = false;
 
 	word_t fd = -1;
 	word_t status;
@@ -123,6 +130,9 @@ void _start(void *cursor)
 
 		switch (stmt->action) {
 		case LOAD_ACTION_OPEN_NEXT:
+			exec_pic_delta = pic_delta;
+			pic_delta = 0;
+			has_interp = true;
 			status = SYSCALL(CLOSE, 1, fd);
 			if (unlikely((int) status < 0))
 				FATAL();
@@ -162,23 +172,32 @@ void _start(void *cursor)
 			break;
 
 		case LOAD_ACTION_MMAP_PIC_FILE:
-			/* PIE binary: use the address that exit.c's fixup_load_addresses()
-			 * pre-selected after scanning /proc/PID/maps and the vdso guard
-			 * zone.  MAP_FIXED is safe here because exit.c already ensured
-			 * the address lies outside all restricted regions. */
-			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
-					stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED, fd,
-					stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
-			if (unlikely(status != stmt->mmap.addr))
-				FATAL();
-
-			if (stmt->mmap.clear_length != 0)
-				clear(stmt->mmap.addr + stmt->mmap.length - stmt->mmap.clear_length,
-					stmt->mmap.addr + stmt->mmap.length);
-
 			if (reset_at_base) {
-				at_base = stmt->mmap.addr;
+				/* First segment of a PIE binary: let the kernel
+				 * choose a conflict-free base address. */
+				status = SYSCALL(MMAP, 6, 0, stmt->mmap.length,
+						stmt->mmap.prot, MAP_PRIVATE, fd,
+						stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
+				if (unlikely((long) status < 0))
+					FATAL();
+				pic_delta = status - stmt->mmap.addr;
+				at_base = status;
 				reset_at_base = false;
+			} else {
+				/* Subsequent segments: MAP_FIXED at delta-adjusted
+				 * address within the kernel-assigned region. */
+				word_t adjusted = stmt->mmap.addr + pic_delta;
+				status = SYSCALL(MMAP, 6, adjusted, stmt->mmap.length,
+						stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED, fd,
+						stmt->mmap.offset >> MMAP_OFFSET_SHIFT);
+				if (unlikely(status != adjusted))
+					FATAL();
+			}
+
+			if (stmt->mmap.clear_length != 0) {
+				word_t actual = stmt->mmap.addr + pic_delta;
+				clear(actual + stmt->mmap.length - stmt->mmap.clear_length,
+					actual + stmt->mmap.length);
 			}
 
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
@@ -194,11 +213,23 @@ void _start(void *cursor)
 			break;
 
 		case LOAD_ACTION_MMAP_PIC_ANON:
-			/* Anon segment of a PIE binary — address pre-selected by exit.c. */
-			status = SYSCALL(MMAP, 6, stmt->mmap.addr, stmt->mmap.length,
-					stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
-			if (unlikely(status != stmt->mmap.addr))
-				FATAL();
+			if (reset_at_base) {
+				/* First segment (anon) of a PIE binary: let the
+				 * kernel choose the base address. */
+				status = SYSCALL(MMAP, 6, 0, stmt->mmap.length,
+						stmt->mmap.prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+				if (unlikely((long) status < 0))
+					FATAL();
+				pic_delta = status - stmt->mmap.addr;
+				at_base = status;
+				reset_at_base = false;
+			} else {
+				word_t adjusted = stmt->mmap.addr + pic_delta;
+				status = SYSCALL(MMAP, 6, adjusted, stmt->mmap.length,
+						stmt->mmap.prot, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
+				if (unlikely(status != adjusted))
+					FATAL();
+			}
 
 			cursor += LOAD_STATEMENT_SIZE(*stmt, mmap);
 			break;
@@ -219,10 +250,14 @@ void _start(void *cursor)
 			word_t *cursor2 = (word_t *) stmt->start.stack_pointer;
 			const word_t argc = cursor2[0];
 			const word_t at_execfn = cursor2[1];
-			/* entry_point, at_phdr, and at_entry were already adjusted by
-			 * exit.c's relocate_load_info() when the PIE binary was moved
-			 * to a guard-zone-free address.  Use them as-is. */
-			const word_t actual_entry = stmt->start.entry_point;
+			/* Apply PIE relocation deltas computed at mmap time.
+			 * entry_point comes from the interp (if present) or exec,
+			 * so it uses the current pic_delta.  at_phdr and at_entry
+			 * always reference the executable, so they use its delta. */
+			const word_t eff_exec_delta = has_interp ? exec_pic_delta : pic_delta;
+			const word_t actual_entry = stmt->start.entry_point + pic_delta;
+			const word_t actual_at_phdr = stmt->start.at_phdr + eff_exec_delta;
+			const word_t actual_at_entry = stmt->start.at_entry + eff_exec_delta;
 			word_t name;
 
 			status = SYSCALL(CLOSE, 1, fd);
@@ -247,7 +282,7 @@ void _start(void *cursor)
 			do {
 				switch (cursor2[0]) {
 				case AT_PHDR:
-					cursor2[1] = stmt->start.at_phdr;
+					cursor2[1] = actual_at_phdr;
 					break;
 
 				case AT_PHENT:
@@ -259,7 +294,7 @@ void _start(void *cursor)
 					break;
 
 				case AT_ENTRY:
-					cursor2[1] = stmt->start.at_entry;
+					cursor2[1] = actual_at_entry;
 					break;
 
 				case AT_BASE:
