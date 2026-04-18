@@ -418,6 +418,13 @@ int sysvipc_shmat_chain(Tracee *tracee, struct SysVIpcConfig *config)
 	{
 		word_t addr = peek_reg(tracee, CURRENT, SYSARG_RESULT);
 
+		/* Diagnostic: log mmap result to distinguish mmap-failure from
+		 * post-mmap SIGBUS on touch (the latter points at ashmem size
+		 * not being bound on some kernels). */
+		fprintf(stderr, "proot-sysvipc: shmat mmap result addr=0x%lx fd=%d size=%lu\n",
+			(unsigned long)addr, (int)config->shmat_mem_fd,
+			(unsigned long)peek_reg(tracee, CURRENT, SYSARG_2));
+
 		struct SysVIpcSharedMemMap *mapping = sysvipc_shm_find_pending_mapping(config->process, config->ipc_namespace, config->waiting_object_index);
 		mapping->addr = addr;
 		mapping->size = peek_reg(tracee, CURRENT, SYSARG_2);
@@ -613,19 +620,32 @@ int sysvipc_shm_namespace_destructor(struct SysVIpcNamespace *ipc_namespace) {
 
 static int sysvipc_shm_do_allocate(size_t size, int shmid) {
 #ifdef __ANDROID__
+	/* Diagnostic: some kernels (HarmonyOS / newer Android without legacy
+	 * ashmem) either lack /dev/ashmem or leave the size unbound, which
+	 * manifests as SIGBUS when the tracee touches the mmap'd page. Log
+	 * every step so the failure mode is visible in the terminal log. */
 	int fd = open("/dev/ashmem", O_RDWR, 0);
-	if (fd < 0) return -ENOSPC;
+	if (fd < 0) {
+		fprintf(stderr, "proot-shm-helper: open(/dev/ashmem) failed errno=%d (%s) size=%zu shmid=0x%X\n",
+			errno, strerror(errno), size, shmid);
+		return -ENOSPC;
+	}
 
 	char name_buffer[ASHMEM_NAME_LEN] = {0};
 	snprintf(name_buffer, ASHMEM_NAME_LEN - 1, "sysvshm_0x%X", shmid);
-	ioctl(fd, ASHMEM_SET_NAME, name_buffer);
+	int name_ret = ioctl(fd, ASHMEM_SET_NAME, name_buffer);
+	int name_errno = errno;
 
 	int ret = ioctl(fd, ASHMEM_SET_SIZE, size);
 	if (ret < 0) {
+		fprintf(stderr, "proot-shm-helper: ASHMEM_SET_SIZE failed errno=%d (%s) size=%zu shmid=0x%X SET_NAME_ret=%d SET_NAME_errno=%d\n",
+			errno, strerror(errno), size, shmid, name_ret, name_errno);
 		close(fd);
 		return -ENOSPC;
 	}
 
+	fprintf(stderr, "proot-shm-helper: ashmem alloc ok fd=%d size=%zu shmid=0x%X SET_NAME_ret=%d\n",
+		fd, size, shmid, name_ret);
 	return fd;
 #else
 	(void) shmid;
