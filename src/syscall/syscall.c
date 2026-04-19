@@ -27,13 +27,11 @@
 
 #include "syscall/syscall.h"
 #include "syscall/chain.h"
-#include "syscall/sysnum.h" /* 仅调试用：stringify_sysnum */
 #include "extension/extension.h"
 #include "tracee/tracee.h"
 #include "tracee/reg.h"
 #include "tracee/mem.h"
 #include "cli/note.h"
-#include <stdio.h> /* 仅调试用：fprintf */
 
 /**
  * Copy in @path a C string (PATH_MAX bytes max.) from the @tracee's
@@ -206,36 +204,6 @@ void translate_syscall(Tracee *tracee)
 		if (tracee->chain.syscalls == NULL || tracee->chain.sysnum_workaround_state == SYSNUM_WORKAROUND_PROCESS_REPLACED_CALL) {
 			tracee->chain.sysnum_workaround_state = SYSNUM_WORKAROUND_INACTIVE;
 			translate_syscall_exit(tracee);
-			/* ── 仅调试用：定位 apk 写 db EPERM 来自哪个 syscall ── */
-			{ /* 仅调试用 */
-				int __r = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT); /* 仅调试用 */
-				if (__r == -EPERM || __r == -EACCES) { /* 仅调试用 */
-					const char *__exe = tracee->exe ? tracee->exe : "?"; /* 仅调试用 */
-					/* 只关心 apk / apk.static 的 EPERM，避免日志爆炸 */ /* 仅调试用 */
-					if (strstr(__exe, "apk") != NULL) { /* 仅调试用 */
-						Sysnum __osn = get_sysnum(tracee, ORIGINAL); /* 仅调试用 */
-						/* 针对 linkat 额外 dump flags + oldpath/newpath 以确认是否 O_TMPFILE 落盘路径 */ /* 仅调试用 */
-						if (__osn == PR_linkat) { /* 仅调试用 */
-							char __op[256] = {0}, __np[256] = {0}; /* 仅调试用 */
-							word_t __op_ptr = peek_reg(tracee, ORIGINAL, SYSARG_2); /* 仅调试用 */
-							word_t __np_ptr = peek_reg(tracee, ORIGINAL, SYSARG_4); /* 仅调试用 */
-							word_t __olddirfd = peek_reg(tracee, ORIGINAL, SYSARG_1); /* 仅调试用 */
-							word_t __newdirfd = peek_reg(tracee, ORIGINAL, SYSARG_3); /* 仅调试用 */
-							word_t __flags = peek_reg(tracee, ORIGINAL, SYSARG_5); /* 仅调试用 */
-							(void) read_string(tracee, __op, __op_ptr, sizeof(__op)-1); /* 仅调试用 */
-							(void) read_string(tracee, __np, __np_ptr, sizeof(__np)-1); /* 仅调试用 */
-							fprintf(stderr, "proot-diag: pid=%d LINKAT olddirfd=%ld oldpath='%s' newdirfd=%ld newpath='%s' flags=0x%lx result=%d\n", /* 仅调试用 */
-								tracee->pid, (long)(int)__olddirfd, __op, (long)(int)__newdirfd, __np, (unsigned long)__flags, __r); /* 仅调试用 */
-						} else { /* 仅调试用 */
-							fprintf(stderr, "proot-diag: pid=%d exe=%s sysnum=%s origsysnum=%s result=%d\n", /* 仅调试用 */
-								tracee->pid, __exe, /* 仅调试用 */
-								stringify_sysnum(get_sysnum(tracee, ORIGINAL)), /* 仅调试用 */
-								stringify_sysnum(get_sysnum(tracee, CURRENT)), /* 仅调试用 */
-								__r); /* 仅调试用 */
-						} /* 仅调试用 */
-					} /* 仅调试用 */
-				} /* 仅调试用 */
-			} /* 仅调试用 */
 		}
 		else if (tracee->chain.sysnum_workaround_state == SYSNUM_WORKAROUND_PROCESS_FAULTY_CALL) {
 			tracee->chain.sysnum_workaround_state = SYSNUM_WORKAROUND_PROCESS_REPLACED_CALL;
